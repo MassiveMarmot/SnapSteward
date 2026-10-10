@@ -327,6 +327,7 @@ class Window(Adw.ApplicationWindow):
         for snap in sorted(changed):
             row = Adw.ActionRow(title=snap, use_markup=False)
             check = Gtk.CheckButton(css_classes=["selection-mode"])
+            check.connect("toggled", self.on_restore_check_toggled)
             self.restore_checks[snap] = check
             row.add_suffix(check)
             row.set_activatable_widget(check)
@@ -338,9 +339,14 @@ class Window(Adw.ApplicationWindow):
         if not changed:
             self.restore_rows.append(Adw.ActionRow(
                 title="Nothing to restore", use_markup=False))
+        self.on_restore_check_toggled(None)
+        self.restore_all_button.set_sensitive(bool(changed))
+
+    def on_restore_check_toggled(self, check):
+        if self.restore_checks is None:
+            return
         self.restore_selected_button.set_sensitive(any(
             c.get_active() for c in self.restore_checks.values()))
-        self.restore_all_button.set_sensitive(bool(changed))
 
     def changed_snaps(self):
         if self.baseline_problem is not None:
@@ -540,10 +546,17 @@ class Window(Adw.ApplicationWindow):
         if skipped:
             lines.append("%d step(s) skipped: names no longer exist"
                          % len(skipped))
-        lines.append("This will ask for approval %d times."
-                     % len(steps))
+        if steps:
+            lines.append("This will ask for approval %d times."
+                         % len(steps))
         alert = Adw.AlertDialog(heading="Restore original connections?",
                                  body="\n".join(lines))
+        self.confirming = True
+        if not steps:
+            alert.add_response("ok", "OK")
+            alert.choose(self, None, self.on_restore_confirmed,
+                         (snaps, steps))
+            return
         alert.add_response("cancel", "Cancel")
         alert.add_response("restore", "Restore")
         alert.set_response_appearance(
@@ -552,6 +565,7 @@ class Window(Adw.ApplicationWindow):
                      (snaps, steps))
 
     def on_restore_confirmed(self, source, result, data):
+        self.confirming = False
         if source.choose_finish(result) != "restore":
             return
         snaps, steps = data
@@ -565,39 +579,56 @@ class Window(Adw.ApplicationWindow):
         batch = self.restore_batch
         if batch is None or self.closing:
             return
-        if batch["index"] >= len(batch["steps"]):
-            self.restore_batch = None
-            self.show_toast("Restore finished")
+        while batch["index"] < len(batch["steps"]):
+            step = batch["steps"][batch["index"]]
+            if step["action"] == "connect" and step.get("tier") == 3:
+                self.restore_batch = None
+                self.busy = False
+                self.show_toast("Stopped: Ginger never connects this "
+                                "interface")
+                return
+            conns = self.connections_by_snap.get(step["plug_snap"]) or {}
+            current = restore._current_established(conns, step["plug_snap"])
+            wanted = (step["plug"], step["slot_snap"], step["slot"])
+            if step["action"] == "connect":
+                stale = wanted in current or not restore._slot_exists(
+                    conns, step["slot_snap"], step["slot"]) \
+                    or restore._interface_of(
+                        conns, step["plug_snap"], step["plug"]) is None
+            else:
+                stale = not any(key[0] == step["plug"] for key in current)
+            if stale:
+                batch["index"] += 1
+                continue
+            n = len(batch["steps"])
+            self.busy = True
+            self.show_toast("Restoring: step %d of %d"
+                            % (batch["index"] + 1, n))
+            threading.Thread(
+                target=self.change_worker,
+                args=(step["action"], step["plug_snap"], step["plug"],
+                      (step["slot_snap"], step["slot"])),
+                daemon=True).start()
             return
-        step = batch["steps"][batch["index"]]
-        n = len(batch["steps"])
-        self.busy = True
-        self.show_toast("Restoring: step %d of %d"
-                        % (batch["index"] + 1, n))
-        threading.Thread(
-            target=self.change_worker,
-            args=(step["action"], step["plug_snap"], step["plug"],
-                  (step["slot_snap"], step["slot"])),
-            daemon=True).start()
+        self.restore_batch = None
+        self.show_toast("Restore finished")
 
     def restore_step_done(self, outcome, message):
         batch = self.restore_batch
         if batch is None or self.closing:
             return
-        done = batch["index"] + 1
+        index = batch["index"]
         n = len(batch["steps"])
         if outcome == changes.OUTCOME_DONE:
-            batch["index"] = done
+            batch["index"] = index + 1
             self.run_restore_step()
             return
         self.restore_batch = None
-        if outcome == changes.OUTCOME_CANCELLED:
-            self.show_toast("Stopped: %d of %d steps done" % (done, n))
-        elif outcome == changes.OUTCOME_TIMEOUT:
+        if outcome == changes.OUTCOME_TIMEOUT:
             self.show_toast("State unknown, reloaded")
-        else:
+        elif outcome != changes.OUTCOME_CANCELLED:
             self.show_toast("Stopped after %d of %d steps: %s"
-                            % (done, n, message or "snapd error"))
+                            % (index, n, message or "snapd error"))
 
     def permissions_group(self, name, connections):
         group = Adw.PreferencesGroup(

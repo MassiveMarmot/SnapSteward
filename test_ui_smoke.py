@@ -1183,35 +1183,54 @@ class RestoreTests(UISmokeTests):
         self.assertEqual(diff["steps"], [])
         self.assertEqual(win.changed_snaps(), {})
 
-    def test_restore_cancelled_mid_batch(self):
+    def test_restore_cancelled_mid_batch_silent(self):
         win = self.base_conns_with_baseline(self.changed_connections())
         win.open_restore_page()
         self.server.interface_responses = [
-            (200, {"type": "sync", "status-code": 200, "result": None}),
             (403, {"type": "error", "status-code": 403,
                    "result": {"message": "cancelled",
                               "kind": "auth-cancelled"}})]
         win.restore_all_button.emit("clicked")
         alert = self.restore_alert(win)
+        toast_before = win.last_toast
         alert.emit("response", "restore")
-        self.run_until(lambda: win.restore_batch is None)
-        self.assertEqual(len(self.server.posts), 2)
-        self.assertIn("Stopped: 1 of 2 steps done",
-                      win.last_toast.get_title())
+        self.run_until(lambda: win.restore_batch is None
+                       and win.busy is False)
+        self.assertEqual(len(self.server.posts), 1)
+        # Silent: the last toast is still the step-1 toast.
+        self.assertIn("Restoring: step 1 of 2",
+                      toast_before.get_title())
+        self.assertIs(win.last_toast, toast_before)
 
-    def test_restore_error_mid_batch(self):
-        win = self.base_conns_with_baseline(self.changed_connections())
+    def test_restore_error_mid_batch_reports_failed_count(self):
+        # Steps 1 and 2 succeed; step 3 fails. The failed step is not
+        # counted as done: "Stopped after 2 of 3".
+        conns = self.changed_connections()
+        conns = copy.deepcopy(conns)
+        conns["established"].append({
+            "slot": {"snap": "snapd", "slot": "network"},
+            "plug": {"snap": "firefox", "plug": "network"},
+            "interface": "network", "manual": True})
+        self.server.snaps = [dict(SNAP_APP)]
+        self.server.default_connections = conns
+        self.write_baseline("firefox", self.baseline_for(conns))
+        win = self.make_window()
+        win.on_snap_selected(win.snaps_list,
+                             win.snaps_list.get_row_at_index(0))
         win.open_restore_page()
-        self.server.interface_responses = [
-            (200, {"type": "sync", "status-code": 200, "result": None}),
-            (500, {"type": "error", "status-code": 500,
-                   "result": {"message": "snapd exploded",
-                              "kind": "internal-error"}})]
+        # Steps 1 and 2 use the default Doing/Done script; change 3
+        # fails with an err.
+        self.server.change_script["3"] = [
+            {"status": "Doing", "ready": False, "err": None},
+            {"status": "Error", "ready": True,
+             "err": "snapd exploded", "summary": "failed"}]
         win.restore_all_button.emit("clicked")
         alert = self.restore_alert(win)
         alert.emit("response", "restore")
         self.run_until(lambda: win.restore_batch is None)
-        self.assertIn("1 of 2", win.last_toast.get_title())
+        self.assertEqual(len(self.server.posts), 3)
+        self.assertIn("Stopped after 2 of 3 steps",
+                      win.last_toast.get_title())
         self.assertIn("snapd exploded", win.last_toast.get_title())
 
     def test_restore_busy_guard_blocks_second_change(self):
@@ -1310,6 +1329,126 @@ class RestoreTests(UISmokeTests):
         self.assertTrue(widget is win.restore_rows
                         or widget.is_ancestor(win.restore_rows),
                         "picked %s" % widget)
+
+    def test_restore_selected_enables_on_check_click(self):
+        win = self.base_conns_with_baseline(self.changed_connections())
+        win.open_restore_page()
+        self.assertFalse(win.restore_selected_button.get_sensitive())
+        check = win.restore_checks["firefox"]
+        check.emit("toggled")
+        self.assertTrue(win.restore_selected_button.get_sensitive())
+        # Clicking the button opens the confirmation dialog.
+        win.restore_selected_button.emit("clicked")
+        alert = self.restore_alert(win)
+        self.assertIn("Connect firefox:camera", alert.get_body())
+        alert.emit("response", "cancel")
+        check.set_active(False)
+        self.assertFalse(win.restore_selected_button.get_sensitive())
+
+    def test_restore_page_controls_pickable(self):
+        win = self.base_conns_with_baseline(self.changed_connections())
+        win.open_restore_page()
+        self.run_until(lambda: win.get_mapped()
+                       and win.restore_rows.get_width() > 1
+                       and win.restore_selected_button.get_width() > 1)
+        for target in (win.restore_checks["firefox"],
+                       win.restore_selected_button,
+                       win.restore_all_button):
+            if not target.get_visible():
+                continue
+            point = Graphene.Point()
+            point.x = target.get_width() / 2
+            point.y = min(target.get_height() / 2, 5)
+            result = target.compute_point(win, point)
+            ok, out = result if isinstance(result, tuple) else (True, result)
+            self.assertTrue(ok)
+            widget = win.pick(out.x, out.y, Gtk.PickFlags.DEFAULT)
+            self.assertIsNotNone(widget)
+            self.assertTrue(widget is target or widget.is_ancestor(target),
+                            "picked %s, expected %s" % (widget, target))
+
+    def test_tier3_step_never_sent(self):
+        win = self.base_conns_with_baseline(self.changed_connections())
+        win.restore_batch = {"snaps": ["firefox"], "steps": [
+            {"action": "connect", "plug_snap": "firefox",
+             "plug": "docker-support", "slot_snap": "snapd",
+             "slot": "docker-support", "tier": 3}], "index": 0}
+        win.run_restore_step()
+        self.assertIsNone(win.restore_batch)
+        self.assertFalse(win.busy)
+        self.assertEqual(self.server.posts, [])
+        self.assertIn("never connects",
+                      win.last_toast.get_title())
+
+    def test_second_confirm_restore_blocked_while_dialog_open(self):
+        win = self.base_conns_with_baseline(self.changed_connections())
+        win.open_restore_page()
+        win.restore_all_button.emit("clicked")
+        alert = self.restore_alert(win)
+        self.assertTrue(win.confirming)
+        win.restore_all_button.emit("clicked")
+        alerts = [d for w in Gtk.Window.list_toplevels()
+                  for d in self.walk(w)
+                  if isinstance(d, Adw.AlertDialog)
+                  and "Restore original connections" in d.get_heading()]
+        self.assertEqual(len(alerts), 1)
+        alert.emit("response", "cancel")
+        self.assertFalse(win.confirming)
+
+    def test_stale_steps_skipped(self):
+        win = self.base_conns_with_baseline(self.changed_connections())
+        win.open_restore_page()
+        win.restore_all_button.emit("clicked")
+        alert = self.restore_alert(win)
+        # The state changes behind the dialog's back: camera is
+        # connected again (as in the baseline), so the connect step
+        # is stale; removable-media stays connected, so the disconnect
+        # is still needed.
+        conns = self.server.default_connections
+        conns["established"].append({
+            "slot": {"snap": "snapd", "slot": "camera"},
+            "plug": {"snap": "firefox", "plug": "camera"},
+            "interface": "camera", "manual": True})
+        win.load()
+        alert.emit("response", "restore")
+        self.run_until(lambda: win.restore_batch is None
+                       and win.busy is False)
+        posts = [body["action"] for _, body, _ in self.server.posts]
+        self.assertEqual(posts, ["disconnect"])
+        self.assertEqual(self.server.posts[0][1]["plugs"][0]["plug"],
+                         "removable-media")
+
+    def test_dialog_with_only_not_restored(self):
+        conns = self.changed_connections()
+        conns = copy.deepcopy(conns)
+        for p in conns["plugs"]:
+            if p["plug"] == "camera":
+                p["interface"] = "docker-support"
+                p["plug"] = "docker-support"
+        for e in conns["established"]:
+            if e["plug"]["plug"] == "camera":
+                e["plug"]["plug"] = "docker-support"
+                e["interface"] = "docker-support"
+        conns["established"] = [e for e in conns["established"]
+                                if e["plug"]["plug"] != "docker-support"]
+        conns["slots"].append({"snap": "snapd", "slot": "docker-support",
+                              "interface": "docker-support",
+                              "connections": []})
+        self.server.snaps = [dict(SNAP_APP)]
+        self.server.default_connections = conns
+        self.write_baseline("firefox", self.baseline_for(conns))
+        win = self.make_window()
+        win.on_snap_selected(win.snaps_list,
+                             win.snaps_list.get_row_at_index(0))
+        win.open_restore_page()
+        win.restore_all_button.emit("clicked")
+        alert = self.restore_alert(win)
+        body = alert.get_body()
+        self.assertNotIn("ask for approval", body)
+        self.assertIn("Not restored by Ginger", body)
+        alert.emit("response", "ok")
+        self.assertIsNone(win.restore_batch)
+        self.assertEqual(self.server.posts, [])
 
 
 
