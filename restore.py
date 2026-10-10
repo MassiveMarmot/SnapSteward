@@ -16,11 +16,11 @@ def _current_established(connections, snap_name):
             continue
         if c["plug"].get("snap") != snap_name:
             continue
-        if not isinstance(c["slot"], dict):
+        if not isinstance(c.get("slot"), dict):
             continue
         key = (str(c["plug"].get("plug") or "?"),
-               str(c["slot"].get("snap") or "?"),
-               str(c["slot"].get("slot") or "?"))
+               str(c.get("slot").get("snap") or "?"),
+               str(c.get("slot").get("slot") or "?"))
         current[key] = c
     return current
 
@@ -47,7 +47,9 @@ def compute_diff(baseline_entry, current_connections, snap_name):
     does not exist in the current response is skipped, never sent."""
     steps, skipped, not_restored = [], [], []
     current = _current_established(current_connections, snap_name)
-    by_plug = {key[0]: key for key in current}
+    by_plug = {}
+    for key in current:
+        by_plug.setdefault(key[0], []).append(key)
     for entry in (baseline_entry or {}).get("connected") or []:
         if not isinstance(entry, dict):
             continue
@@ -78,25 +80,37 @@ def compute_diff(baseline_entry, current_connections, snap_name):
                               "plug": plug, "slot_snap": slot_snap,
                               "slot": slot, "tier": tier})
         else:
-            key = by_plug[plug]
-            if key != (plug, slot_snap, slot):
+            keys = by_plug[plug]
+            if (plug, slot_snap, slot) in keys:
+                continue
+            # Only manual connections are Restore's business; a
+            # plug auto-connected to another slot is left alone.
+            manual_keys = [k for k in keys if current[k].get("manual")]
+            if not manual_keys:
+                continue
+            if not _slot_exists(current_connections, slot_snap, slot):
+                skipped.append({"snap": snap_name, "plug": plug,
+                                "reason": "slot not in current "
+                                          "connections"})
+                continue
+            interface = _interface_of(current_connections, snap_name, plug)
+            tier = interfaces.tier_for(interface or "?")
+            if tier == 3:
+                not_restored.append(
+                    {"snap": snap_name, "plug": plug,
+                     "command": "snap connect %s:%s %s:%s"
+                                % (snap_name, plug, slot_snap, slot)})
+                continue
+            for key in manual_keys:
                 c = current[key]
                 steps.append({"action": "disconnect",
                               "plug_snap": snap_name, "plug": plug,
                               "slot_snap": key[1], "slot": key[2],
                               "tier": interfaces.tier_for(
                                   str(c.get("interface") or "?"))})
-                if _slot_exists(current_connections, slot_snap, slot):
-                    interface = _interface_of(current_connections,
-                                              snap_name, plug)
-                    tier = interfaces.tier_for(interface or "?")
-                    steps.append({"action": "connect", "plug_snap": snap_name,
-                                  "plug": plug, "slot_snap": slot_snap,
-                                  "slot": slot, "tier": tier})
-                else:
-                    skipped.append({"snap": snap_name, "plug": plug,
-                                    "reason": "slot not in current "
-                                              "connections"})
+            steps.append({"action": "connect", "plug_snap": snap_name,
+                          "plug": plug, "slot_snap": slot_snap,
+                          "slot": slot, "tier": tier})
     for key, c in current.items():
         plug = key[0]
         in_baseline = any(

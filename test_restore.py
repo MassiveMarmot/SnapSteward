@@ -168,6 +168,76 @@ class ComputeDiffTests(unittest.TestCase):
         self.assertEqual(d["steps"], [])
         self.assertEqual(len(d["skipped"]), 1)
 
+    def test_mismatch_with_baseline_slot_gone_adds_no_steps(self):
+        c = self.connections(
+            established=[conn("camera", slot_snap="other", slot="camera",
+                              manual=True)],
+            plugs=[plug_entry("camera")],
+            slots=[slot_entry("camera", snap="other")])
+        d = self.diff(baseline(("camera", "snapd", "camera")), c)
+        self.assertEqual(d["steps"], [])
+        self.assertEqual(len(d["skipped"]), 1)
+        self.assertIn("slot not in current connections",
+                      d["skipped"][0]["reason"])
+
+    def test_mismatch_tier3_goes_to_not_restored(self):
+        c = self.connections(
+            established=[conn("docker-support", slot_snap="other",
+                              slot="docker-support",
+                              interface="docker-support", manual=True)],
+            plugs=[plug_entry("docker-support", interface="docker-support")],
+            slots=[slot_entry("docker-support", snap="other"),
+                   slot_entry("docker-support")])
+        d = self.diff(
+            baseline(("docker-support", "snapd", "docker-support")), c)
+        self.assertEqual(d["steps"], [])
+        self.assertEqual(len(d["not_restored"]), 1)
+        self.assertEqual(d["not_restored"][0]["command"],
+                         "snap connect firefox:docker-support "
+                         "snapd:docker-support")
+
+    def test_established_without_slot_key_does_not_raise(self):
+        # The malformed entry is ignored: camera counts as not
+        # established, so the baseline connect is a normal step.
+        c = self.connections(
+            established=[{"plug": {"snap": "firefox",
+                                   "plug": "camera"},
+                           "interface": "camera", "manual": True}],
+            plugs=[plug_entry("camera")], slots=[slot_entry("camera")])
+        d = self.diff(baseline(("camera", "snapd", "camera")), c)
+        self.assertEqual([(s["action"], s["plug"]) for s in d["steps"]],
+                         [("connect", "camera")])
+        self.assertEqual(d["skipped"], [])
+
+    def test_mismatch_auto_connected_not_disconnected(self):
+        # A plug auto-connected to a different slot than the baseline is
+        # never touched by Restore.
+        c = self.connections(
+            established=[conn("camera", slot_snap="other", slot="camera",
+                              manual=False)],
+            plugs=[plug_entry("camera")],
+            slots=[slot_entry("camera", snap="other"),
+                   slot_entry("camera")])
+        d = self.diff(baseline(("camera", "snapd", "camera")), c)
+        self.assertEqual(d["steps"], [])
+
+    def test_plug_connected_to_several_slots(self):
+        c = self.connections(
+            established=[
+                conn("camera", slot_snap="other", slot="camera",
+                     manual=True),
+                conn("camera", slot_snap="third", slot="camera",
+                     manual=True)],
+            plugs=[plug_entry("camera")],
+            slots=[slot_entry("camera", snap="other"),
+                   slot_entry("camera", snap="third"),
+                   slot_entry("camera")])
+        d = self.diff(baseline(("camera", "snapd", "camera")), c)
+        actions = [(s["action"], s["slot_snap"]) for s in d["steps"]]
+        self.assertEqual(actions, [("disconnect", "other"),
+                                    ("disconnect", "third"),
+                                    ("connect", "snapd")])
+
 
 class ChangedSnapsTests(unittest.TestCase):
     def test_changed_snaps_counts(self):
