@@ -12,6 +12,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 import baseline
 import changes
 import interfaces
+import restore
 from snapd_client import Client, SnapdError
 
 APP_ID = "io.github.massivemarmot.Ginger"
@@ -43,6 +44,7 @@ class Window(Adw.ApplicationWindow):
         self.query = ""
         self.show_libraries = False
         self.show_all_interfaces = False
+        self.only_changed = False
         self.connections = {}
         self.connections_by_snap = {}
         self.baselines = {}
@@ -52,6 +54,7 @@ class Window(Adw.ApplicationWindow):
         self.closing = False
         self.suppress_switch_handler = False
         self.last_toast = None
+        self.restore_batch = None
 
         self.sidebar_rows = Gtk.ListBox(css_classes=["navigation-sidebar"])
         self.sidebar_rows.connect("row-activated", self.on_page_selected)
@@ -83,11 +86,13 @@ class Window(Adw.ApplicationWindow):
             collapsed=False, show_sidebar=True, min_sidebar_width=250)
 
         self.snaps_page = self.build_snaps_page()
+        self.restore_page = self.build_restore_page()
         self.error_page = Adw.StatusPage(icon_name="network-error-symbolic")
         self.error_wrapper = self.page_with_header(self.error_page)
 
         self.page_stack = Gtk.Stack(vhomogeneous=False)
         self.page_stack.add_named(self.snaps_page, "snaps")
+        self.page_stack.add_named(self.restore_page, "restore")
         self.page_stack.add_named(self.error_wrapper, "error")
 
         self.baseline_banner = Adw.Banner(
@@ -143,7 +148,8 @@ class Window(Adw.ApplicationWindow):
 
     def build_sidebar(self):
         self.sidebar_rows.remove_all()
-        for name, icon in (("Snaps", "application-x-executable-symbolic"),):
+        for name, icon in (("Snaps", "application-x-executable-symbolic"),
+                           ("Restore", "document-revert-symbolic")):
             row = Gtk.ListBoxRow()
             row.page_name = name
             box = Gtk.Box(margin_top=12, margin_bottom=12,
@@ -165,7 +171,17 @@ class Window(Adw.ApplicationWindow):
     def on_page_selected(self, box, row):
         if self.main_split.get_collapsed():
             self.main_split.set_show_sidebar(False)
-        self.page_stack.set_visible_child_name("snaps")
+        name = getattr(row, "page_name", "Snaps") if row is not None \
+            else "Snaps"
+        if name == "Restore":
+            self.page_stack.set_visible_child_name("restore")
+        else:
+            self.page_stack.set_visible_child_name("snaps")
+
+    def open_restore_page(self, *args):
+        self.sidebar_rows.select_row(self.sidebar_rows.get_row_at_index(1))
+        self.on_page_selected(self.sidebar_rows,
+                              self.sidebar_rows.get_row_at_index(1))
 
     def snap_names(self):
         names = {}
@@ -178,11 +194,14 @@ class Window(Adw.ApplicationWindow):
 
     def visible_snaps(self):
         out = []
+        changed = self.changed_snaps()
         for name in sorted(self.snap_map):
             snap = self.snap_map[name]
             if not self.show_libraries and not snap.get("has_apps"):
                 continue
             if self.query and self.query.lower() not in name.lower():
+                continue
+            if self.only_changed and name not in changed:
                 continue
             out.append(name)
         return out
@@ -256,11 +275,19 @@ class Window(Adw.ApplicationWindow):
                                 use_markup=False)
         all_row.add_suffix(all_check)
         all_row.set_activatable_widget(all_check)
+        changed_check = Gtk.CheckButton(css_classes=["selection-mode"])
+        changed_check.connect("toggled", self.on_changed_check_toggled)
+        changed_row = Adw.ActionRow(title="Only changed snaps",
+                                   use_markup=False)
+        changed_row.add_suffix(changed_check)
+        changed_row.set_activatable_widget(changed_check)
         group = Adw.PreferencesGroup()
         group.add(lib_row)
         group.add(all_row)
+        group.add(changed_row)
         self.lib_check = lib_check
         self.all_check = all_check
+        self.changed_check = changed_check
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
         view.add_top_bar(header)
@@ -269,6 +296,63 @@ class Window(Adw.ApplicationWindow):
         view.set_content(scroller)
         return view
 
+    def build_restore_page(self):
+        self.restore_checks = None
+        self.restore_rows = Gtk.ListBox(
+            css_classes=["navigation-sidebar"])
+        self.restore_selected_button = Gtk.Button(
+            label="Restore selected")
+        self.restore_selected_button.connect(
+            "clicked", lambda *a: self.on_restore_selected())
+        self.restore_all_button = Gtk.Button(label="Restore all")
+        self.restore_all_button.connect(
+            "clicked", lambda *a: self.confirm_restore(None))
+        header = Adw.HeaderBar()
+        header.pack_start(self.make_sidebar_toggle())
+        header.pack_end(self.restore_all_button)
+        header.pack_end(self.restore_selected_button)
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        scroller.set_child(self.restore_rows)
+        view.set_content(scroller)
+        page = Adw.NavigationPage(title="Restore")
+        page.set_child(view)
+        return page
+
+    def refresh_restore_page(self):
+        self.restore_rows.remove_all()
+        self.restore_checks = {}
+        changed = self.changed_snaps()
+        for snap in sorted(changed):
+            row = Adw.ActionRow(title=snap, use_markup=False)
+            check = Gtk.CheckButton(css_classes=["selection-mode"])
+            self.restore_checks[snap] = check
+            row.add_suffix(check)
+            row.set_activatable_widget(check)
+            steps = restore.compute_diff(
+                self.baselines.get(snap),
+                self.connections_by_snap.get(snap) or {}, snap)
+            row.set_subtitle("%d steps" % len(steps["steps"]))
+            self.restore_rows.append(row)
+        if not changed:
+            self.restore_rows.append(Adw.ActionRow(
+                title="Nothing to restore", use_markup=False))
+        self.restore_selected_button.set_sensitive(any(
+            c.get_active() for c in self.restore_checks.values()))
+        self.restore_all_button.set_sensitive(bool(changed))
+
+    def changed_snaps(self):
+        if self.baseline_problem is not None:
+            return {}
+        return restore.changed_snaps(
+            self.baselines, self.connections_by_snap)
+
+    def on_restore_selected(self):
+        snaps = sorted(snap for snap, check in self.restore_checks.items()
+                       if check.get_active())
+        self.confirm_restore(snaps)
+
     def on_lib_check_toggled(self, check):
         self.show_libraries = check.get_active()
         self.refresh_list()
@@ -276,6 +360,10 @@ class Window(Adw.ApplicationWindow):
     def on_all_check_toggled(self, check):
         self.show_all_interfaces = check.get_active()
         self.update_detail()
+
+    def on_changed_check_toggled(self, check):
+        self.only_changed = check.get_active()
+        self.refresh_list()
 
     def on_filter_toggled(self, button):
         active = button.get_active()
@@ -302,6 +390,7 @@ class Window(Adw.ApplicationWindow):
             self.snaps_list.append(row)
         self.update_detail()
         self.highlight_selected_row()
+        self.refresh_restore_page()
 
     def snap_row(self, name):
         connections = self.connections_by_snap.get(name)
@@ -313,6 +402,9 @@ class Window(Adw.ApplicationWindow):
         row.set_activatable(True)
         row.snap_name = name
         row.add_prefix(Gtk.Image(icon_name="application-x-executable-symbolic"))
+        if name in self.changed_snaps():
+            row.add_suffix(Gtk.Image(icon_name="document-modified-symbolic",
+                                     tooltip_text="Modified"))
         return row
 
     def highlight_selected_row(self):
@@ -374,6 +466,16 @@ class Window(Adw.ApplicationWindow):
         box.append(card)
         connections = self.connections_by_snap.get(name)
         if connections is not None:
+            if name in self.changed_snaps():
+                banner_row = Adw.ActionRow(
+                    title="This snap differs from its original state",
+                    use_markup=False)
+                restore_button = Gtk.Button(label="Restore original…")
+                restore_button.connect(
+                    "clicked", lambda *a: self.confirm_restore([name]))
+                banner_row.add_suffix(restore_button)
+                banner_row.set_activatable_widget(restore_button)
+                box.append(banner_row)
             box.append(self.permissions_group(name, connections))
         self.detail_bin.set_child(box)
 
@@ -397,6 +499,105 @@ class Window(Adw.ApplicationWindow):
         baseline.quarantine_unreadable(
             time.strftime("%Y%m%d-%H%M%S"))
         self.load()
+
+    def restore_diff_for(self, snaps):
+        steps, skipped, not_restored = [], [], []
+        for snap in snaps:
+            diff = restore.compute_diff(
+                self.baselines.get(snap),
+                self.connections_by_snap.get(snap) or {}, snap)
+            steps.extend(diff["steps"])
+            skipped.extend(diff["skipped"])
+            not_restored.extend(diff["not_restored"])
+        return steps, skipped, not_restored
+
+    def confirm_restore(self, snaps):
+        # snaps is None for all changed snaps, or a list of snap names.
+        if self.busy or self.confirming or self.baseline_problem is not None:
+            return
+        if snaps is None:
+            snaps = sorted(self.changed_snaps())
+        snaps = [s for s in snaps if s in self.baselines]
+        if not snaps:
+            return
+        steps, skipped, not_restored = self.restore_diff_for(snaps)
+        if not steps and not not_restored:
+            self.show_toast("Already matches the original state")
+            return
+        lines = ["Restore also reverts changes made outside Ginger since "
+                 "the saved original state (for example with "
+                 "snap connect)."]
+        for step in steps:
+            verb = "Connect" if step["action"] == "connect" \
+                else "Disconnect"
+            line = "%s %s:%s" % (verb, step["plug_snap"], step["plug"])
+            if step["tier"] >= 2:
+                line += " (sensitive interface)"
+            lines.append(line)
+        for item in not_restored:
+            lines.append("Not restored by Ginger: %s (run ‘%s’)"
+                         % (item["plug"], item["command"]))
+        if skipped:
+            lines.append("%d step(s) skipped: names no longer exist"
+                         % len(skipped))
+        lines.append("This will ask for approval %d times."
+                     % len(steps))
+        alert = Adw.AlertDialog(heading="Restore original connections?",
+                                 body="\n".join(lines))
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("restore", "Restore")
+        alert.set_response_appearance(
+            "restore", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.choose(self, None, self.on_restore_confirmed,
+                     (snaps, steps))
+
+    def on_restore_confirmed(self, source, result, data):
+        if source.choose_finish(result) != "restore":
+            return
+        snaps, steps = data
+        if not steps:
+            return
+        self.restore_batch = {"snaps": snaps, "steps": steps,
+                               "index": 0}
+        self.run_restore_step()
+
+    def run_restore_step(self):
+        batch = self.restore_batch
+        if batch is None or self.closing:
+            return
+        if batch["index"] >= len(batch["steps"]):
+            self.restore_batch = None
+            self.show_toast("Restore finished")
+            return
+        step = batch["steps"][batch["index"]]
+        n = len(batch["steps"])
+        self.busy = True
+        self.show_toast("Restoring: step %d of %d"
+                        % (batch["index"] + 1, n))
+        threading.Thread(
+            target=self.change_worker,
+            args=(step["action"], step["plug_snap"], step["plug"],
+                  (step["slot_snap"], step["slot"])),
+            daemon=True).start()
+
+    def restore_step_done(self, outcome, message):
+        batch = self.restore_batch
+        if batch is None or self.closing:
+            return
+        done = batch["index"] + 1
+        n = len(batch["steps"])
+        if outcome == changes.OUTCOME_DONE:
+            batch["index"] = done
+            self.run_restore_step()
+            return
+        self.restore_batch = None
+        if outcome == changes.OUTCOME_CANCELLED:
+            self.show_toast("Stopped: %d of %d steps done" % (done, n))
+        elif outcome == changes.OUTCOME_TIMEOUT:
+            self.show_toast("State unknown, reloaded")
+        else:
+            self.show_toast("Stopped after %d of %d steps: %s"
+                            % (done, n, message or "snapd error"))
 
     def permissions_group(self, name, connections):
         group = Adw.PreferencesGroup(
@@ -526,6 +727,11 @@ class Window(Adw.ApplicationWindow):
 
     def change_done(self, action, snap_name, plug, slot, outcome, message):
         if self.closing:
+            return False
+        if self.restore_batch is not None:
+            self.busy = False
+            self.load()
+            self.restore_step_done(outcome, message)
             return False
         self.busy = False
         self.load()
@@ -700,7 +906,10 @@ class App(Adw.Application):
 
 
 def main():
-    App().run(sys.argv)
+    try:
+        App().run(sys.argv)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

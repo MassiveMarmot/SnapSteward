@@ -23,11 +23,15 @@ CHANGE_ID_RE = re.compile(r"[A-Za-z0-9-]+")
 
 
 def check_allowed(method, path):
-    path = path.split("?", 1)[0]
-    if (method, path) in ALLOWED_CALLS:
+    base, _, query = path.partition("?")
+    if (method, base) in ALLOWED_CALLS:
+        if query and (method, base) != ("GET", "/v2/connections"):
+            raise SnapdError("query not allowed: %s" % path,
+                             kind="not-allowed")
         return
-    if method == "GET" and path.startswith("/v2/changes/") \
-            and re.fullmatch(CHANGE_ID_RE, path[len("/v2/changes/"):]):
+    if method == "GET" and base.startswith("/v2/changes/") \
+            and not query \
+            and re.fullmatch(CHANGE_ID_RE, base[len("/v2/changes/"):]):
         return
     raise SnapdError("call not allowed: %s %s" % (method, path),
                      kind="not-allowed")
